@@ -46,6 +46,11 @@ from harness.effort import effort_config
 from harness.environment import start_environment
 from harness.evaluator.evaluate import evaluate_run
 from harness.evaluator.scorer import run_verifier, score_run
+from harness.orchestrator.config import (
+    ORCHESTRATOR_ENGINE,
+    OrchestrationConfig,
+    strip_engine_prefix,
+)
 from harness.persistence import maybe_post_run_summary
 from harness.pricing import cost_usd, has_cached_input_price, is_priced
 from harness.provenance import source_provenance
@@ -176,7 +181,7 @@ def run_agent(  # noqa: PLR0915
     """
     check_effort_allowed(effort)  # vulcanbench.toml: levels that never run, checked before anything
     task = load_task(task_id, tasks_root)
-    cli_adapter, provider, effort_meta = _resolve_run_engine(
+    cli_adapter, provider, effort_meta, orchestrator_spec = _resolve_run_engine(
         model, provider, effort, sandbox, agent_container
     )
     if agent_container and cli_adapter is None:
@@ -222,33 +227,40 @@ def run_agent(  # noqa: PLR0915
     ]
 
     try:
-        prompt_tokens, completion_tokens, finished, cost_capped, actual_steps, cli_outcome = (
-            _execute_agent(
-                cli_adapter=cli_adapter,
-                model=model,
-                provider=provider,
-                task=task,
-                tools=tools,
-                messages=messages,
-                effective_max_steps=effective_max_steps,
-                collector=collector,
-                executor=executor,
-                run_id=run_id,
-                run_dir=run_dir,
-                workspace=workspace,
-                deadline=deadline,
-                effort_meta=effort_meta,
-                network=network,
-                max_run_cost=max_run_cost,
-                agent_container_spec=(
-                    AgentContainerSpec(
-                        image=default_agent_image(cli_adapter.harness_id),
-                        resources=resources,
-                    )
-                    if agent_container and cli_adapter is not None
-                    else None
-                ),
-            )
+        (
+            prompt_tokens,
+            completion_tokens,
+            finished,
+            cost_capped,
+            actual_steps,
+            cli_outcome,
+            (orchestration_report),
+        ) = _execute_agent(
+            cli_adapter=cli_adapter,
+            model=model,
+            provider=provider,
+            task=task,
+            tools=tools,
+            messages=messages,
+            effective_max_steps=effective_max_steps,
+            collector=collector,
+            executor=executor,
+            run_id=run_id,
+            run_dir=run_dir,
+            workspace=workspace,
+            deadline=deadline,
+            effort_meta=effort_meta,
+            network=network,
+            max_run_cost=max_run_cost,
+            orchestrator_spec=orchestrator_spec,
+            agent_container_spec=(
+                AgentContainerSpec(
+                    image=default_agent_image(cli_adapter.harness_id),
+                    resources=resources,
+                )
+                if agent_container and cli_adapter is not None
+                else None
+            ),
         )
         patch = _git_diff(workspace)
         changed_files = _git_changed_files(workspace)
@@ -297,8 +309,11 @@ def run_agent(  # noqa: PLR0915
     collector.record("metric_computed", scores)
 
     cached_input_tokens = cli_outcome.cached_input_tokens if cli_outcome else 0
+    # The engine prefix is not part of the priced spec: an orchestrated run
+    # bills exactly like the same model run through the plain vulcan loop.
+    pricing_model = strip_engine_prefix(model)
     cost = _compute_cost(
-        model,
+        pricing_model,
         prompt_tokens,
         completion_tokens,
         judge_model,
@@ -320,7 +335,7 @@ def run_agent(  # noqa: PLR0915
                 None
                 if cost["total"] is None
                 else "estimated-from-reported-tokens-with-cache-pricing"
-                if cached_input_tokens and has_cached_input_price(model)
+                if cached_input_tokens and has_cached_input_price(pricing_model)
                 else "estimated-from-reported-tokens-no-cache-discount"
                 if cached_input_tokens
                 else "estimated-from-reported-tokens"
@@ -373,6 +388,7 @@ def run_agent(  # noqa: PLR0915
             ),
             **({"experiment_id": experiment_id} if experiment_id else {}),
             **({"cli_agent": cli_outcome.summary()} if cli_outcome else {}),
+            **({"orchestration": orchestration_report} if orchestration_report else {}),
             # External harnesses may browse; the audit matches their web
             # activity against the task's upstream provenance so a run that
             # fetched its own solution is flagged, never silently counted.
@@ -424,13 +440,33 @@ def _resolve_run_engine(
     effort: str | None,
     sandbox: str,
     agent_container: bool = False,
-) -> tuple[CliAgentAdapter | None, LLMProvider | None, Any]:
-    """Decide whether ``model`` runs as a vendor agent CLI or via a provider.
+) -> tuple[CliAgentAdapter | None, LLMProvider | None, Any, str | None]:
+    """Decide whether ``model`` runs as a vendor agent CLI, the orchestration
+    engine over a provider, or the plain provider model loop.
 
     External harnesses execute their own tools and bill a subscription. Claude
     Code currently uses the host workspace; Codex adds its own workspace-write
     sandbox. Setup and verification must run against that same workspace.
+
+    The fourth return element is the inner ``provider:model`` spec when the
+    ``orchestrator:`` engine prefix selects the ledger engine (and pricing
+    must use the stripped spec), else ``None``.
     """
+    if model.startswith(ORCHESTRATOR_ENGINE + ":"):
+        inner_spec = strip_engine_prefix(model)
+        if provider is None:
+            if is_cli_agent_spec(inner_spec):
+                raise ValueError(
+                    f"the {ORCHESTRATOR_ENGINE} engine drives the API tool loop; "
+                    f"it cannot wrap a vendor CLI spec {model!r}"
+                )
+            provider = get_provider(inner_spec)
+        return (
+            None,
+            provider,
+            effort_config(provider.name, effort, provider.model),
+            inner_spec,
+        )
     if provider is None and is_cli_agent_spec(model):
         adapter = get_cli_agent_adapter(model)
         # Claude Code executes tools on the host workspace and must acknowledge
@@ -450,9 +486,9 @@ def _resolve_run_engine(
                 "its own tool execution; pass --sandbox local to acknowledge "
                 "host execution, or --agent-container to run it in a container"
             )
-        return adapter, None, effort_config(adapter.harness_id, effort)
+        return adapter, None, effort_config(adapter.harness_id, effort), None
     provider = provider or get_provider(model)
-    return None, provider, effort_config(provider.name, effort, provider.model)
+    return None, provider, effort_config(provider.name, effort, provider.model), None
 
 
 def _execute_agent(
@@ -473,9 +509,10 @@ def _execute_agent(
     effort_meta: Any,
     network: bool,
     max_run_cost: float | None,
+    orchestrator_spec: str | None = None,
     agent_container_spec: AgentContainerSpec | None = None,
-) -> tuple[int, int, bool, bool, int, CliAgentOutcome | None]:
-    """Run the agent phase: the vendor CLI in the workspace, or the model loop."""
+) -> tuple[int, int, bool, bool, int, CliAgentOutcome | None, dict[str, Any] | None]:
+    """Run the agent phase: vendor CLI, ledger orchestration, or the model loop."""
     if cli_adapter is not None:
         _, cli_model = parse_model_spec(model)
         outcome = cli_adapter.run_task(
@@ -501,22 +538,54 @@ def _execute_agent(
             outcome.cost_capped,
             outcome.num_turns if outcome.num_turns is not None else 0,
             outcome,
+            None,
         )
     assert provider is not None  # resolved by _resolve_run_engine for non-CLI specs
-    prompt_tokens, completion_tokens, finished, cost_capped, actual_steps = _run_model_loop(
-        provider,
-        tools,
-        messages,
-        effective_max_steps,
-        collector,
-        executor,
-        run_id,
-        deadline,
-        effort_meta.as_summary() if effort_meta else None,
-        model=model,
-        max_run_cost=max_run_cost,
+    if orchestrator_spec is not None:
+        # Lazy import: the engine module imports this one (its role adapters
+        # reuse the same model loop, deadline and tool plumbing).
+        from harness.orchestrator.engine import run_orchestration  # noqa: PLC0415, import cycle
+
+        orch_outcome = run_orchestration(
+            task=task,
+            provider=provider,
+            pricing_model=orchestrator_spec,
+            effort=effort_meta.as_summary() if effort_meta else None,
+            config=OrchestrationConfig.default(),
+            max_steps=effective_max_steps,
+            max_run_cost=max_run_cost,
+            deadline=deadline,
+            collector=collector,
+            executor=executor,
+            workspace=workspace,
+            run_dir=run_dir,
+            run_id=run_id,
+        )
+        return (
+            orch_outcome.prompt_tokens,
+            orch_outcome.completion_tokens,
+            orch_outcome.finished,
+            orch_outcome.cost_capped,
+            orch_outcome.steps,
+            None,
+            orch_outcome.report,
+        )
+    prompt_tokens, completion_tokens, finished, cost_capped, actual_steps, _last_content = (
+        _run_model_loop(
+            provider,
+            tools,
+            messages,
+            effective_max_steps,
+            collector,
+            executor,
+            run_id,
+            deadline,
+            effort_meta.as_summary() if effort_meta else None,
+            model=model,
+            max_run_cost=max_run_cost,
+        )
     )
-    return prompt_tokens, completion_tokens, finished, cost_capped, actual_steps, None
+    return prompt_tokens, completion_tokens, finished, cost_capped, actual_steps, None, None
 
 
 def _compute_cost(
@@ -672,7 +741,7 @@ def _budget_exceeded_scores(functional: float, total_tokens: int, steps: int) ->
     )
 
 
-def _run_model_loop(  # noqa: PLR0912, linear ReAct loop with budget + cost guards
+def _run_model_loop(  # noqa: PLR0912, PLR0915, linear ReAct loop with budget + cost guards
     provider: LLMProvider,
     tools: list[dict[str, Any]],
     messages: list[dict[str, Any]],
@@ -684,12 +753,15 @@ def _run_model_loop(  # noqa: PLR0912, linear ReAct loop with budget + cost guar
     effort: dict[str, Any] | None = None,
     model: str | None = None,
     max_run_cost: float | None = None,
-) -> tuple[int, int, bool, bool, int]:
+    role: str | None = None,
+    tool_allowlist: frozenset[str] | None = None,
+) -> tuple[int, int, bool, bool, int, str | None]:
     prompt_tokens = 0
     completion_tokens = 0
     finished = False
     cost_capped = False
     actual_steps = 0
+    last_content: str | None = None
 
     for step in range(1, max_steps + 1):
         if not deadline.ensure_time(collector, "llm_request", step):
@@ -698,6 +770,8 @@ def _run_model_loop(  # noqa: PLR0912, linear ReAct loop with budget + cost guar
         request_data: dict[str, Any] = {"step": step, "messages": len(messages)}
         if effort is not None:
             request_data["effort"] = effort
+        if role is not None:
+            request_data["role"] = role
         collector.record("llm_request", request_data)
         try:
             resp = _complete_provider(provider, messages, tools, deadline.remaining_s(), effort)
@@ -708,14 +782,16 @@ def _run_model_loop(  # noqa: PLR0912, linear ReAct loop with budget + cost guar
             raise
         prompt_tokens += resp.usage.prompt_tokens
         completion_tokens += resp.usage.completion_tokens
-        collector.record(
-            "llm_response",
-            {
-                "content": resp.content,
-                "tool_calls": [tc.model_dump() for tc in resp.tool_calls],
-                "usage": resp.usage.model_dump(),
-            },
-        )
+        response_data: dict[str, Any] = {
+            "content": resp.content,
+            "tool_calls": [tc.model_dump() for tc in resp.tool_calls],
+            "usage": resp.usage.model_dump(),
+        }
+        if role is not None:
+            response_data["role"] = role
+        collector.record("llm_response", response_data)
+        if resp.content:
+            last_content = resp.content
         if not deadline.ensure_time(collector, "llm_response", step):
             break
 
@@ -743,7 +819,15 @@ def _run_model_loop(  # noqa: PLR0912, linear ReAct loop with budget + cost guar
         for tc in resp.tool_calls:
             if not deadline.ensure_time(collector, f"tool:{tc.name}", step):
                 break
-            observation = _execute_tool(executor, tc, run_id, step, deadline.remaining_s())
+            if tool_allowlist is not None and tc.name not in tool_allowlist:
+                # Read-only roles (brainstorm, fresh perspective) must not run
+                # side-effecting tools even if the model requests them.
+                observation: dict[str, Any] = {
+                    "result": None,
+                    "error": f"tool {tc.name!r} is not available to role {role or 'agent'!r}",
+                }
+            else:
+                observation = _execute_tool(executor, tc, run_id, step, deadline.remaining_s())
             collector.record("tool_call", {"tool": tc.name, "args": tc.arguments, "id": tc.id})
             collector.record(
                 "tool_observation",
@@ -770,7 +854,7 @@ def _run_model_loop(  # noqa: PLR0912, linear ReAct loop with budget + cost guar
             if not deadline.ensure_time(collector, f"tool:{tc.name}", step):
                 break
 
-    return prompt_tokens, completion_tokens, finished, cost_capped, actual_steps
+    return prompt_tokens, completion_tokens, finished, cost_capped, actual_steps, last_content
 
 
 _MANIFEST_TOOLS = ("git", "ruff", "bandit", "radon", "go", "node")

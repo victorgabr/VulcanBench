@@ -110,6 +110,27 @@ its own setting, not a calibrated equivalent.
 | Ollama | `ollama:<model>` | none | local inference through any OpenAI-compatible server; cost records as $0 and duration measures your hardware |
 | Mock | `mock:synthetic` | none | deterministic, offline |
 
+### Orchestrated solver (API billing)
+
+The same API loop can run under a manager instead of as one agent.
+`--harness orchestrator` keeps a plan, task list, notes and verification log
+on disk, dispatches one worker at a time, and gates every round on a
+verification command the manager names, restoring the git checkpoint when a
+round fails. One read-only brainstorm pass runs up front on tasks worth the
+overhead, and a bounded finalizer pass runs only when sign-off was not clean.
+
+```bash
+vulcanbench run --task hello-world --harness orchestrator --model openai:gpt-5.4-mini
+```
+
+Budgets (wall-clock, model-loop steps, cost cap) are shared with the plain
+loop, so an orchestrated run stays comparable to the baseline column of the
+same model at equal budgets; cost is priced from the plain `provider:model`
+spec while the run records the engine, so orchestrated results stay their own
+leaderboard group. The run summary gains an `orchestration` block (rounds,
+reverts, per-role tokens, termination reason). Decision log:
+[docs/DECISIONS.md](docs/DECISIONS.md).
+
 ### Subscription harnesses
 
 A harness run drives the product's own coding-agent CLI on a subscription while

@@ -466,7 +466,7 @@ def test_cursor_allows_docker_verifier(fake_cursor: Path) -> None:
     # legal: the agent works the host workspace while setup/verification run in
     # Docker. Forcing local also forced the verifier onto the host, where
     # toolchains don't match the sandbox image.
-    adapter, provider, _ = _resolve_run_engine(
+    adapter, provider, _, _ = _resolve_run_engine(
         model="cursor:grok-4.6", provider=None, effort=None, sandbox="docker"
     )
     assert adapter is not None and adapter.harness_id == "cursor"
@@ -865,14 +865,14 @@ def test_zcode_rejects_unenforceable_live_cost_cap(tmp_path: Path, fake_zcode: P
 
 
 def test_zcode_allows_docker_verifier() -> None:
-    adapter, provider, effort = _resolve_run_engine(
+    adapter, provider, effort, _ = _resolve_run_engine(
         model="zcode:glm-5.3", provider=None, effort="high", sandbox="docker"
     )
     assert adapter is not None and adapter.harness_id == "zcode"
     assert provider is None
     assert effort is not None and effort.provider_value == "high" and effort.supported
     # medium has no ZCode level: recorded-but-not-sent.
-    _, _, medium = _resolve_run_engine(
+    _, _, medium, _ = _resolve_run_engine(
         model="zcode:glm-5.3", provider=None, effort="medium", sandbox="docker"
     )
     assert medium is not None and medium.supported is False

@@ -7,6 +7,40 @@ changing run conditions. Suite-level policy for v4 lives in
 [tasks/coding-intelligence-index-v4/CHARTER.md](../tasks/coding-intelligence-index-v4/CHARTER.md);
 entries here record the measurements behind those rules.
 
+## 2026-10-17: the orchestrator engine is serial-only and shares the plain loop's budgets
+
+The ledger orchestration engine (`--harness orchestrator`, spec
+`orchestrator:provider:model`) puts a manager over the API tool loop: it plans
+from an on-disk ledger (plan, task list, notes, verification log), dispatches
+one worker per round, and gates every round on a verification command the
+manager names, restoring the git checkpoint when a gate fails. Three
+run-condition decisions:
+
+- Budgets are shared, not per-role. Wall-clock deadline, total model-loop
+  steps and the cost cap apply to the whole run exactly as in the plain
+  vulcan loop, so an orchestrated column is comparable to the baseline column
+  of the same model at equal budgets. Manager rounds carry a soft cap of 6
+  and a hard ceiling of 10 (the cycle bound used by published scaffolds of
+  this shape); a worker starts only with at least 6 steps left, and the
+  brainstorm pass is skipped below 24 total steps so cheap tasks never pay
+  the orchestration overhead. Revisit when an orchestrated column is
+  published: if equal-budget runs collapse to equal cost, consider raising
+  the soft cap.
+- Serial only in v1. The ledger's one-active-task invariant forbids parallel
+  worker fan-out, so per-round token spend stays attributable and the trace
+  stays a linear story. Parallel workers would be a new column, not a flag
+  on this one.
+- Orchestrated runs are their own leaderboard group. The manifest keeps the
+  full `orchestrator:provider:model` spec while pricing uses the stripped
+  `provider:model` spec, so cost per task reads directly against the plain
+  run of the same model and the engine never mixes columns.
+
+Evidence: `tests/test_orchestrator.py` (unit plus end-to-end through the real
+verifier and real git), including the failing-gate case where the checkpoint
+restore reverts round 1's write and the retry round still clears the gate.
+No published suite column uses the engine yet; suite/run separation per
+[docs/HOW_WE_WORK.md](HOW_WE_WORK.md) applies before any sweep.
+
 ## 2026-10-13: Wonder Full Low is re-run with Muse Code's skill reminder off
 
 Meta advised the owner that Muse Code's built-in skill-reminder plugin is

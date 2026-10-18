@@ -9,6 +9,26 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Added
 
+- **Ledger orchestration engine** (`--harness orchestrator`, composed spec
+  `orchestrator:provider:model`): the API tool loop runs under a manager that
+  plans from a persistent on-disk ledger (plan, task list, notes, verification
+  log, best candidate) and dispatches one worker at a time through a bounded
+  tool loop. Every round is gated on a verification command the manager names;
+  a failing gate restores the git checkpoint taken before the round and the
+  manager re-decides. One read-only anti-anchoring brainstorm pass runs before
+  the first round on tasks worth the overhead (skipped below 24 total steps),
+  and a bounded finalizer pass runs only when sign-off was not clean. Budgets
+  are shared with the plain vulcan loop (same wall-clock deadline, same total
+  model-loop steps, same cost cap), with a soft cap of 6 manager rounds and a
+  hard ceiling of 10, so an orchestrated run stays comparable to the baseline
+  columns at equal budgets. Pricing uses the stripped `provider:model` spec
+  while the manifest keeps the full engine spec, so leaderboards group
+  orchestrated runs separately at directly comparable cost. The summary gains
+  an `orchestration` block (rounds, reverts, per-role token accounting,
+  termination reason) and the trace gains `orchestration_start`,
+  `orchestration_verify`, `orchestration_revert` and `orchestration_end`
+  events, with a `role` tag on every model request.
+
 - **Devin CLI harness** (`--harness devin`, `devin:<model>` specs,
   `harness/agent/devin_cli.py`): runs a task in Cognition's local Devin agent
   (`devin -p`, permission mode `dangerous`) on the signed-in Devin account,

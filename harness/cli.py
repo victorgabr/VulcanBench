@@ -32,6 +32,7 @@ from harness.compare import build_matrix
 from harness.cost_estimate import estimate_plan
 from harness.effort import DEFAULT_SWEEP_EFFORTS, parse_efforts
 from harness.leaderboard import aggregate_by_model, scan_leaderboard
+from harness.orchestrator.config import ORCHESTRATOR_ENGINE, strip_engine_prefix
 from harness.pricing import is_priced
 from harness.provenance import (
     ALLOW_DIRTY_ENV,
@@ -72,7 +73,7 @@ app.add_typer(harness_app, name="harness")
 console = Console()
 
 
-def _execution_spec(model: str, harness_name: str, billing: str) -> str:
+def _execution_spec(model: str, harness_name: str, billing: str) -> str:  # noqa: PLR0912, CLI option normalization with engine guards
     """Normalize explicit harness/access options to the legacy model spec."""
     harness_name = harness_name.strip().lower()
     billing = billing.strip().lower()
@@ -81,6 +82,25 @@ def _execution_spec(model: str, harness_name: str, billing: str) -> str:
     prefix = model.partition(":")[0].strip().lower() if ":" in model else ""
     if harness_name == "vulcan" and prefix in CLI_AGENT_PROVIDERS:
         harness_name = prefix
+    if harness_name == ORCHESTRATOR_ENGINE:
+        if billing == "subscription":
+            raise ValueError(
+                "--billing subscription is for vendor CLI harnesses; the "
+                "orchestrator engine always bills API tokens"
+            )
+        if prefix == ORCHESTRATOR_ENGINE:
+            return model
+        if prefix in CLI_AGENT_PROVIDERS:
+            raise ValueError(
+                f"the {ORCHESTRATOR_ENGINE} engine drives the API tool loop; "
+                f"it cannot wrap vendor CLI {prefix!r}"
+            )
+        if ":" not in model:
+            raise ValueError(
+                f"--harness {ORCHESTRATOR_ENGINE} needs a provider:model spec, "
+                "e.g. --model openai:gpt-5.4-mini"
+            )
+        return f"{ORCHESTRATOR_ENGINE}:{model}"
     if harness_name == "vulcan":
         if billing == "subscription":
             raise ValueError(
@@ -89,7 +109,7 @@ def _execution_spec(model: str, harness_name: str, billing: str) -> str:
             )
         return model
     if harness_name not in CLI_AGENT_PROVIDERS:
-        known = ", ".join(["vulcan", *sorted(CLI_AGENT_PROVIDERS)])
+        known = ", ".join(["vulcan", ORCHESTRATOR_ENGINE, *sorted(CLI_AGENT_PROVIDERS)])
         raise ValueError(f"unknown --harness {harness_name!r}; known: {known}")
     if billing == "api":
         raise ValueError(
@@ -194,13 +214,14 @@ def run(  # noqa: PLR0912, PLR0915, CLI entry: option declarations + linear guar
         ...,
         "--model",
         "-m",
-        help="Model id. Use provider:model for Vulcan's API loop, or a bare model "
+        help="Model id. Use provider:model for Vulcan's API loop, provider:model "
+        "with --harness orchestrator for the ledger engine, or a bare model "
         "with --harness claude-code|codex|cursor|grok-build|zcode|muse-code|devin|pi.",
     ),
     harness_name: str = typer.Option(
         "vulcan",
         "--harness",
-        help="Execution harness: vulcan|claude-code|codex|cursor|grok-build|zcode|muse-code|devin|pi",
+        help="Execution harness: vulcan|orchestrator|claude-code|codex|cursor|grok-build|zcode|muse-code|devin|pi",
     ),
     billing: str = typer.Option(
         "auto",
@@ -349,7 +370,10 @@ def run(  # noqa: PLR0912, PLR0915, CLI entry: option declarations + linear guar
             )
             raise typer.Exit(code=1)
         judge = judge_model or model
-        unpriced = [m for m, used in ((model, True), (judge, judges)) if used and not is_priced(m)]
+        pricing_model = strip_engine_prefix(model)
+        unpriced = [
+            m for m, used in ((pricing_model, True), (judge, judges)) if used and not is_priced(m)
+        ]
         if unpriced:
             names = ", ".join(sorted(set(unpriced)))
             console.print(f"[red]error[/red] --max-cost needs priced models; no price for {names}")
@@ -360,9 +384,10 @@ def run(  # noqa: PLR0912, PLR0915, CLI entry: option declarations + linear guar
                 f"[red]error[/red] --max-run-cost must be a finite number > 0, got {max_run_cost}"
             )
             raise typer.Exit(code=1)
-        if not is_priced(model):
+        if not is_priced(strip_engine_prefix(model)):
             console.print(
-                f"[red]error[/red] --max-run-cost needs a priced model; no price for {model}"
+                f"[red]error[/red] --max-run-cost needs a priced model; no price for "
+                f"{strip_engine_prefix(model)}"
             )
             raise typer.Exit(code=1)
     if only_missing and suite is None:
@@ -382,7 +407,7 @@ def run(  # noqa: PLR0912, PLR0915, CLI entry: option declarations + linear guar
             f"[yellow]dry-run[/yellow] would run {target} model={model} "
             f"sandbox={sandbox}{effort_note}"
         )
-        if is_priced(model):
+        if is_priced(strip_engine_prefix(model)):
             try:
                 if suite is not None:
                     task_ids = load_suite(suite).task_ids
@@ -390,7 +415,7 @@ def run(  # noqa: PLR0912, PLR0915, CLI entry: option declarations + linear guar
                     assert task is not None  # one of --task/--suite is required
                     task_ids = [task]
                 plan = estimate_plan(
-                    models=[model],
+                    models=[strip_engine_prefix(model)],
                     task_ids=task_ids,
                     repeat=repeat,
                     judges=judges,
@@ -823,9 +848,10 @@ def effort_sweep(  # noqa: PLR0912, PLR0915, CLI entry: validation + per-effort 
                 f"[red]error[/red] --max-run-cost must be a finite number > 0, got {max_run_cost}"
             )
             raise typer.Exit(code=1)
-        if not is_priced(model):
+        if not is_priced(strip_engine_prefix(model)):
             console.print(
-                f"[red]error[/red] --max-run-cost needs a priced model; no price for {model}"
+                f"[red]error[/red] --max-run-cost needs a priced model; no price for "
+                f"{strip_engine_prefix(model)}"
             )
             raise typer.Exit(code=1)
 
