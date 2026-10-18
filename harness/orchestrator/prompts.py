@@ -47,7 +47,10 @@ def manager_system_prompt() -> str:
         '  "next": {"task_id": "T3", "brief": "ONE bounded objective for the worker"},\n'
         '  "verify_cmd": "single shell command run in the workspace to objectively'
         ' check the worker change; empty string means run the repo test suite",\n'
-        '  "revert_on_failure": true,\n'
+        '  "revert_on_failure": false,\n'
+        "(default false: a failed round's edits stay in the workspace so partial"
+        " progress is still graded; set true only when the change actively poisons"
+        " the repo for the next round),\n"
         '  "complete": false,\n'
         '  "reason": "one line"\n'
         "}\n"

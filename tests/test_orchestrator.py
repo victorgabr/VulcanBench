@@ -10,13 +10,15 @@ from __future__ import annotations
 
 import json
 import subprocess
+import time
+from dataclasses import replace
 from pathlib import Path
 from typing import Any
 
 import pytest
 
 import harness.agent.loop as loop_mod
-from harness.agent.loop import run_agent
+from harness.agent.loop import _RunDeadline, run_agent
 from harness.agent.providers import LLMProvider, LLMResponse, TokenUsage, ToolInvocation
 from harness.cli import _execution_spec
 from harness.orchestrator.config import (
@@ -24,7 +26,12 @@ from harness.orchestrator.config import (
     OrchestrationConfig,
     strip_engine_prefix,
 )
-from harness.orchestrator.engine import _external_verify_command, _parse_decision, run_orchestration
+from harness.orchestrator.engine import (
+    _external_verify_command,
+    _parse_decision,
+    _ReserveDeadline,
+    run_orchestration,
+)
 from harness.orchestrator.gitstate import checkpoint, restore
 from harness.orchestrator.ledger import Ledger
 
@@ -38,11 +45,27 @@ class ScriptedProvider(LLMProvider):
     manager supplies in its decision, letting tests force a failing round.
     """
 
-    def __init__(self, *, verify_cmds: dict[int, str] | None = None) -> None:
+    def __init__(
+        self,
+        *,
+        verify_cmds: dict[int, str] | None = None,
+        revert: bool | None = True,
+        skip_second_edit: bool = False,
+    ) -> None:
         super().__init__("scripted")
         self.verify_cmds = verify_cmds or {}
+        self.revert = revert
+        self.skip_second_edit = skip_second_edit
         self.calls: dict[str, int] = {}
         self.role_order: list[str] = []
+
+    def _manager_json(self, payload: dict[str, Any]) -> str:
+        """Apply the revert-knob policy: None omits the key (engine default)."""
+        if self.revert is None:
+            payload.pop("revert_on_failure", None)
+        else:
+            payload["revert_on_failure"] = self.revert
+        return json.dumps(payload)
 
     @property
     def name(self) -> str:
@@ -89,7 +112,7 @@ class ScriptedProvider(LLMProvider):
         if role == "manager":
             if n == 1:
                 return LLMResponse(
-                    content=json.dumps(
+                    content=self._manager_json(
                         {
                             "tasks": [
                                 {
@@ -108,7 +131,6 @@ class ScriptedProvider(LLMProvider):
                                 "brief": "create hello.py with the exact print line",
                             },
                             "verify_cmd": self.verify_cmds.get(1, "test -s hello.py"),
-                            "revert_on_failure": True,
                             "complete": False,
                             "reason": "seed",
                         }
@@ -121,7 +143,7 @@ class ScriptedProvider(LLMProvider):
             nxt_task = None if "[done]" in ledger_view else {2: "T2"}.get(n)
             if nxt_task is not None:
                 return LLMResponse(
-                    content=json.dumps(
+                    content=self._manager_json(
                         {
                             "task_updates": [
                                 {
@@ -136,7 +158,6 @@ class ScriptedProvider(LLMProvider):
                                 "brief": "write hello.py again; keep it minimal",
                             },
                             "verify_cmd": self.verify_cmds.get(n, "test -s hello.py"),
-                            "revert_on_failure": True,
                             "complete": False,
                             "reason": "retry with corrected gate",
                         }
@@ -166,7 +187,8 @@ class ScriptedProvider(LLMProvider):
             workers_seen = self.calls.get("worker", 0)
             # Odd worker calls issue the edit; even ones close with text.
             prior_tool_turns = sum(1 for m in messages if m.get("role") == "tool")
-            if prior_tool_turns == 0:
+            repeat_write = self.skip_second_edit and self.calls.get("worker", 0) >= 3
+            if prior_tool_turns == 0 and not repeat_write:
                 return LLMResponse(
                     tool_calls=[
                         ToolInvocation(
@@ -432,3 +454,107 @@ def test_config_default_budgets_are_serial_only() -> None:
     assert cfg.max_rounds <= cfg.hard_max_rounds
     assert cfg.max_fresh_perspectives == 1  # never an ensemble
     assert run_orchestration.__name__ == "run_orchestration"
+
+
+# -- grading reserve and revert policy ----------------------------------------
+
+
+def test_reserve_deadline_withholds_grading_tail() -> None:
+    inner = _RunDeadline(time.monotonic(), 2.0)
+    shim = _ReserveDeadline(inner, 1.5)
+    rem = shim.remaining_s()
+    assert rem is not None and rem <= 0.5
+    time.sleep(1.0)
+    # The engine's view expires and self-limits while the real run deadline
+    # still holds the reserved slice, and a shim stop never flags the budget.
+    assert shim.remaining_s() == 0.0 and shim.is_expired()
+    assert not inner.is_expired() and not inner.exceeded
+
+
+def test_orchestrated_failed_round_keeps_work_by_default(tmp_path: Path) -> None:
+    provider = ScriptedProvider(
+        verify_cmds={1: "test -e never-created-marker.txt"},
+        revert=None,
+        skip_second_edit=True,
+    )
+    res = _orchestrated_run(tmp_path, provider)
+    summary = res["summary"]
+    orch = summary["orchestration"]
+
+    assert orch["termination"] == "manager-complete"
+    assert orch["rounds"] == 2
+    assert orch["verify_failures"] == 1
+    assert orch["reverts"] == 0
+    # A failed round keeps its edits: the surviving hello.py passes the
+    # repair round's gate and is graded by the real verifier.
+    workspace = tmp_path / res["run_id"] / "workspace"
+    hello = workspace / "hello.py"
+    assert hello.exists() and hello.read_text() == HELLO_LINE
+    assert summary["scores"]["functional"] == 1.0
+    assert '"orchestration_revert"' not in (tmp_path / res["run_id"] / "trace.jsonl").read_text()
+
+
+class StallingProvider(LLMProvider):
+    """Never signs off: dispatches bounded rounds until the wall clock runs out."""
+
+    def __init__(self, call_s: float = 0.4) -> None:
+        super().__init__("scripted")
+        self.call_s = call_s
+        self.n = 0
+
+    @property
+    def name(self) -> str:
+        return "mock"
+
+    def complete(
+        self,
+        messages: list[dict[str, Any]],
+        tools: list[dict[str, Any]],
+        timeout_s: float | None = None,
+        effort: str | None = None,
+    ) -> LLMResponse:
+        del tools, timeout_s, effort
+        time.sleep(self.call_s)
+        usage = TokenUsage(prompt_tokens=50, completion_tokens=20)
+        if any("VULCANBENCH_JUDGE" in str(m.get("content", "")) for m in messages):
+            return LLMResponse(content='{"score": 80, "rationale": "mock judge"}', usage=usage)
+        role = (
+            str(messages[0].get("content", ""))
+            .partition("VULCANBENCH_ORCH_ROLE: ")[2]
+            .split("\n", 1)[0]
+        )
+        if role == "manager":
+            self.n += 1
+            task_id = f"T{self.n}"
+            return LLMResponse(
+                content=json.dumps(
+                    {
+                        "next": {"task_id": task_id, "brief": "inspect the repo; do not edit"},
+                        "verify_cmd": "true",
+                        "complete": False,
+                    }
+                ),
+                usage=usage,
+            )
+        return LLMResponse(content="probed; no edits", usage=usage)
+
+
+def test_orchestrated_run_reserves_wall_clock_for_grading(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    monkeypatch.setattr(
+        OrchestrationConfig,
+        "default",
+        classmethod(lambda cls: replace(cls(), grading_reserve_s=2.0)),
+    )
+    res = _orchestrated_run(tmp_path, StallingProvider(), timeout_s=4.0)
+    summary = res["summary"]
+    orch = summary["orchestration"]
+
+    # The engine self-limits on its reserve view and reports the deadline stop,
+    # but the hidden verifier runs against the final workspace instead of
+    # being zeroed by an exhausted run budget.
+    assert orch["termination"] == "deadline"
+    assert orch["rounds"] >= 1
+    assert summary["finished"] is False
+    assert summary["scores"].get("budget_exceeded") is not True

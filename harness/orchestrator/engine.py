@@ -12,6 +12,11 @@ requirement: wall-clock (``_RunDeadline``), total model-loop steps and the
 per-run cost cap are the same knobs the baseline uses, so orchestrated and
 baseline columns stay comparable at equal budgets. The round cap (soft 6,
 hard 10) is an additional engine-internal bound; the paper's bound is 10.
+
+Grading integrity: the engine withholds the last ``grading_reserve_s`` of the
+wall clock from every model phase, so the hidden verifier always runs against
+the final workspace instead of being zeroed by an exhausted deadline.
+
 """
 
 from __future__ import annotations
@@ -21,7 +26,12 @@ from dataclasses import dataclass, field
 from pathlib import Path
 from typing import Any
 
-from harness.agent.loop import _complete_provider, _remaining_timeout, _run_model_loop
+from harness.agent.loop import (
+    _complete_provider,
+    _remaining_timeout,
+    _run_model_loop,
+    _RunDeadline,
+)
 from harness.agent.protocol import RunCommandArgs, get_openai_tool_schemas
 from harness.orchestrator import gitstate, prompts
 from harness.orchestrator.config import OrchestrationConfig
@@ -52,6 +62,29 @@ BEST_CLIP = 3_000
 PLAN_CLIP = 2_000
 WORKER_TAIL = 2_500
 DIFFSTAT_CLIP = 1_200
+
+
+class _ReserveDeadline(_RunDeadline):
+    """View of the run deadline with the last ``reserve_s`` withheld.
+
+    The engine's model phases consume this view, so the hidden verifier and
+    evaluation stages always start with at least ``reserve_s`` of wall clock
+    left. This mirrors how the plain ``vulcan`` loop keeps that room by
+    self-limiting its steps: a stop under the reserve is self-limitation, not
+    a budget breach, so it never sets the shared ``exceeded`` flag and the run
+    is scored honestly (no "run budget exceeded before verification" zeroes).
+    """
+
+    def __init__(self, inner: _RunDeadline, reserve_s: float) -> None:
+        super().__init__(inner.started_mono, inner.timeout_s)
+        self._inner = inner
+        self._reserve_s = max(0.0, reserve_s)
+
+    def remaining_s(self) -> float | None:
+        remaining = self._inner.remaining_s()
+        if remaining is None:
+            return None
+        return max(0.0, remaining - self._reserve_s)
 
 
 @dataclass
@@ -159,6 +192,7 @@ def run_orchestration(  # noqa: PLR0912, PLR0915  (linear serial loop: guards, r
     roles: dict[str, _RoleStats] = {}
     spend = {"prompt": 0, "completion": 0, "steps": 0, "calls": 0}
     state = {"cost_capped": False}
+    model_deadline = _ReserveDeadline(deadline, config.grading_reserve_s)
 
     def record(role: str, prompt_tokens: int, completion_tokens: int, steps: int) -> None:
         st = roles.setdefault(role, _RoleStats())
@@ -198,16 +232,16 @@ def run_orchestration(  # noqa: PLR0912, PLR0915  (linear serial loop: guards, r
     # -- role adapters ---------------------------------------------------------
 
     def one_shot(role: str, *, system: str, user: str) -> str | None:
-        if not deadline.ensure_time(collector, f"llm_request:{role}"):
+        if not model_deadline.ensure_time(collector, f"llm_request:{role}"):
             return None
         messages = [
             {"role": "system", "content": system},
             {"role": "user", "content": user},
         ]
         try:
-            resp = _complete_provider(provider, messages, [], deadline.remaining_s(), effort)
+            resp = _complete_provider(provider, messages, [], model_deadline.remaining_s(), effort)
         except Exception:
-            if deadline.is_expired():
+            if model_deadline.is_expired():
                 return None
             raise
         usage = resp.usage
@@ -241,7 +275,7 @@ def run_orchestration(  # noqa: PLR0912, PLR0915  (linear serial loop: guards, r
             collector,
             executor,
             run_id,
-            deadline,
+            model_deadline,
             effort=effort,
             role=role,
             tool_allowlist=allowlist,
@@ -259,7 +293,8 @@ def run_orchestration(  # noqa: PLR0912, PLR0915  (linear serial loop: guards, r
             str(task.issue).strip(),
             "",
             "## Execution constraints",
-            f"- wall-clock budget {deadline.timeout_s}s shared by every role",
+            f"- wall-clock budget {deadline.timeout_s}s shared by every role, less a"
+            f" {config.grading_reserve_s}s reserve held back for final grading",
             f"- total model-loop steps {max_steps} shared by every role",
             f"- manager rounds: soft cap {config.max_rounds}, hard ceiling {config.hard_max_rounds}",
             "- strictly serial: manager -> one worker -> verification -> manager",
@@ -362,7 +397,11 @@ def run_orchestration(  # noqa: PLR0912, PLR0915  (linear serial loop: guards, r
 
     # -- initial ideation (single, serial; skipped for cheap tasks) -----------------
 
-    if max_steps >= config.skip_brainstorm_below_steps and budget_stop() is None:
+    if (
+        max_steps >= config.skip_brainstorm_below_steps
+        and budget_stop() is None
+        and not model_deadline.is_expired()
+    ):
         b_content, _used = bounded_worker(
             "brainstorm",
             system=prompts.brainstorm_system_prompt(),
@@ -395,6 +434,9 @@ def run_orchestration(  # noqa: PLR0912, PLR0915  (linear serial loop: guards, r
         stop = budget_stop()
         if stop:
             termination = stop
+            break
+        if model_deadline.is_expired():
+            termination = "deadline"
             break
         if rounds >= min(config.max_rounds, config.hard_max_rounds):
             termination = "round-budget"
@@ -505,7 +547,7 @@ def run_orchestration(  # noqa: PLR0912, PLR0915  (linear serial loop: guards, r
             vres = executor.run_command(
                 RunCommandArgs(
                     cmd=verify_cmd,
-                    timeout=_remaining_timeout(600, deadline.remaining_s),
+                    timeout=_remaining_timeout(600, model_deadline.remaining_s),
                 )
             )
         except Exception as exc:  # a verify tooling failure counts as a failed check
@@ -517,7 +559,7 @@ def run_orchestration(  # noqa: PLR0912, PLR0915  (linear serial loop: guards, r
         reverted = False
         if not last_verify_ok:
             verify_failures += 1
-            if decision.get("revert_on_failure", True) and checkpoint is not None:
+            if decision.get("revert_on_failure", False) and checkpoint is not None:
                 try:
                     gitstate.restore(workspace, checkpoint)
                     reverts += 1
@@ -570,14 +612,18 @@ def run_orchestration(  # noqa: PLR0912, PLR0915  (linear serial loop: guards, r
         decision = manager_call(seed=False, round_block=last_round_block)
         if decision is not None:
             apply_decision(decision)
+    if termination == "unknown":
+        expired_window = deadline.is_expired() or model_deadline.is_expired()
+        termination = "deadline" if expired_window else "manager-unreachable"
 
     # -- finalizer (unresolved cases only) ------------------------------------------------
 
     final_verify_ok: bool | None = None
     if (
         not finished
-        and termination not in ("deadline", "cost-cap")
+        and termination != "cost-cap"
         and steps_left() >= config.min_worker_steps
+        and not model_deadline.is_expired()
     ):
         finalizer_used = True
         f_content, _used = bounded_worker(
@@ -599,7 +645,9 @@ def run_orchestration(  # noqa: PLR0912, PLR0915  (linear serial loop: guards, r
         final_cmd = _external_verify_command(workspace)
         try:
             fres = executor.run_command(
-                RunCommandArgs(cmd=final_cmd, timeout=_remaining_timeout(600, deadline.remaining_s))
+                RunCommandArgs(
+                    cmd=final_cmd, timeout=_remaining_timeout(600, model_deadline.remaining_s)
+                )
             )
             final_verify_ok = (
                 int(fres.get("exit_code", 1)) == 0 if isinstance(fres, dict) else False

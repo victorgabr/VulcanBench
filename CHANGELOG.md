@@ -14,8 +14,11 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   plans from a persistent on-disk ledger (plan, task list, notes, verification
   log, best candidate) and dispatches one worker at a time through a bounded
   tool loop. Every round is gated on a verification command the manager names;
-  a failing gate restores the git checkpoint taken before the round and the
-  manager re-decides. One read-only anti-anchoring brainstorm pass runs before
+  a failing gate is recorded and the manager re-decides, and the manager can
+  opt in to restoring the pre-round checkpoint with `revert_on_failure`. The
+  engine holds the last 60 seconds of the wall clock back from every model
+  phase so the hidden verifier always grades the final workspace. One
+  read-only anti-anchoring brainstorm pass runs before
   the first round on tasks worth the overhead (skipped below 24 total steps),
   and a bounded finalizer pass runs only when sign-off was not clean. Budgets
   are shared with the plain vulcan loop (same wall-clock deadline, same total
@@ -340,6 +343,24 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   provider keys and base URLs into `os.environ` for the whole session; provider
   tests then passed or failed based on the machine's configuration. A new autouse
   fixture in `tests/conftest.py` clears provider routing and credential vars.
+
+- **Orchestrated runs no longer zero their own grading.** In 19 of 27
+  recorded orchestrated runs, the manager rounds consumed the whole wall-clock
+  deadline, the hidden verifier started with no time left, and the run scored
+  functional 0 through the budget-exceeded path even when the workspace held
+  working code. The engine now gives every model phase a deadline view with
+  the last 60 seconds withheld (`grading_reserve_s` in the orchestration
+  config) and stops starting new rounds once that view expires, mirroring how
+  the plain vulcan loop self-limits before the clock runs out. A reserve stop
+  reports termination `deadline` without flagging the run budget as exceeded,
+  so the verifier grades the final workspace.
+- **Failed orchestration rounds keep their edits by default.** Checkpoint
+  restore after a failed gate discarded work that could still earn partial
+  hidden credit; all 4 recorded runs with reverts ended at functional 0. The
+  manager's
+  `revert_on_failure` decision now defaults to false; set it true to restore
+  the pre-round checkpoint. The revert path stays tested and is opt-in per
+  round.
 
 ## [0.8.0] - 2026-07-29
 

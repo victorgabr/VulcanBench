@@ -7,6 +7,39 @@ changing run conditions. Suite-level policy for v4 lives in
 [tasks/coding-intelligence-index-v4/CHARTER.md](../tasks/coding-intelligence-index-v4/CHARTER.md);
 entries here record the measurements behind those rules.
 
+## 2026-10-18: orchestration reserves grading time and keeps failed-round work
+
+Two run-condition fixes to the orchestrator engine, measured across the 27
+recorded orchestrated runs in `runs/` before the change:
+
+- Grading reserve (default 60s, `grading_reserve_s` in the orchestration
+  config). 19 of the 27 orchestrated runs scored functional 0 through the
+  budget-exceeded path: the manager rounds spent the entire wall-clock
+  deadline and the hidden verifier started with zero time remaining. Every
+  model phase (brainstorm, manager, workers, finalizer, round verify
+  commands) now runs against a deadline view that withholds the last 60
+  seconds, and the engine stops starting new rounds once that view expires.
+  The stop reports termination `deadline` but never flags the run budget as
+  exceeded, mirroring how the plain vulcan loop self-limits before the clock
+  hits zero and keeps its score.
+- Revert is opt-in. Checkpoint restore after a failed gate discarded work
+  that still earned partial hidden credit: all 4 recorded runs with reverts
+  ended at functional 0. The manager's `revert_on_failure` decision now
+  defaults to false and the engine restores the pre-round checkpoint only on
+  an explicit true. Hidden scoring is partial-credit and the escalation
+  reference behavior keeps whatever works, so the failed round's edits stay
+  in the workspace while the ledger records the gate as failed.
+
+Evidence: `tests/test_orchestrator.py` gained a unit test for the reserve
+view and two end-to-end regressions (a stalling manager whose run self-stops
+on the reserve yet still gets a graded verifier result; a failed round whose
+work survives by default and clears the repair gate).
+Revisit when the orchestrated column is published: deadline-stopped runs must
+carry real verifier scores, not budget-exceeded zeros. If the hidden verifier
+for compiled suites needs more than 60s, raise `grading_reserve_s` per run,
+not per role.
+
+
 ## 2026-10-17: the orchestrator engine is serial-only and shares the plain loop's budgets
 
 The ledger orchestration engine (`--harness orchestrator`, spec

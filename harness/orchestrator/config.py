@@ -53,6 +53,10 @@ class OrchestrationConfig:
     #: Tasks whose total step budget is below this skip the brainstorm pass
     #: (the activation gate: cheap tasks do not pay for orchestration).
     skip_brainstorm_below_steps: int = 24
+    #: Wall clock held back from every model phase so the hidden verifier and
+    #: evaluation always run against the final workspace. The engine stops
+    #: starting new work once less than this remains.
+    grading_reserve_s: int = 60
 
     @classmethod
     def default(cls) -> OrchestrationConfig:
