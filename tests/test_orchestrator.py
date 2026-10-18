@@ -51,11 +51,13 @@ class ScriptedProvider(LLMProvider):
         verify_cmds: dict[int, str] | None = None,
         revert: bool | None = True,
         skip_second_edit: bool = False,
+        manager_garbage: bool = False,
     ) -> None:
         super().__init__("scripted")
         self.verify_cmds = verify_cmds or {}
         self.revert = revert
         self.skip_second_edit = skip_second_edit
+        self.manager_garbage = manager_garbage
         self.calls: dict[str, int] = {}
         self.role_order: list[str] = []
 
@@ -110,6 +112,8 @@ class ScriptedProvider(LLMProvider):
             )
 
         if role == "manager":
+            if self.manager_garbage:
+                return LLMResponse(content="I cannot decide right now, sorry.", usage=usage)
             if n == 1:
                 return LLMResponse(
                     content=self._manager_json(
@@ -558,3 +562,25 @@ def test_orchestrated_run_reserves_wall_clock_for_grading(
     assert orch["rounds"] >= 1
     assert summary["finished"] is False
     assert summary["scores"].get("budget_exceeded") is not True
+
+
+def test_orchestrated_run_answers_when_manager_never_parses(tmp_path: Path) -> None:
+    provider = ScriptedProvider(manager_garbage=True)
+    res = _orchestrated_run(tmp_path, provider)
+    summary = res["summary"]
+    orch = summary["orchestration"]
+
+    # Every manager call (seed and re-decisions) returns unparseable text. The
+    # offline fallback keeps the engine answering: it opens an issue-driven
+    # AUTO task, the worker round lands the write, and the run signs off on a
+    # passing gate instead of ending with rounds=0 and a zero workspace.
+    assert orch["termination"] == "offline-complete"
+    assert orch["manager_fallbacks"] >= 2
+    assert orch["rounds"] >= 1
+    assert summary["finished"] is True
+    assert summary["scores"].get("functional") == 1.0
+    run_dir = tmp_path / res["run_id"]
+    tasks = json.loads((run_dir / "ledger" / "tasks.json").read_text(encoding="utf-8"))
+    assert any(str(t["id"]).startswith("AUTO-") and t["status"] == "done" for t in tasks)
+    trace = [json.loads(line) for line in (run_dir / "trace.jsonl").read_text().splitlines()]
+    assert any(e.get("type") == "orchestration_fallback" for e in trace)

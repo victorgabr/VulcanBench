@@ -118,9 +118,11 @@ on disk, dispatches one worker at a time, and gates every round on a
 verification command the manager names. A failed round keeps its edits by
 default (the manager can opt in to a checkpoint revert), and the engine holds
 the last 60 seconds of the wall clock back from every model phase so the
-hidden verifier always grades the final workspace. One read-only brainstorm
-pass runs up front on tasks worth the overhead, and a bounded finalizer pass
-runs only when sign-off was not clean.
+hidden verifier always grades the final workspace. If the manager's reply
+stays unparseable after a retry, the engine keeps answering: it runs the
+oldest pending task or an issue-driven AUTO task until budgets run out. One
+read-only brainstorm pass runs up front on tasks worth the overhead, and a
+bounded finalizer pass runs only when sign-off was not clean.
 
 ```bash
 vulcanbench run --task hello-world --harness orchestrator --model openai:gpt-5.4-mini

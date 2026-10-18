@@ -17,9 +17,13 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   a failing gate is recorded and the manager re-decides, and the manager can
   opt in to restoring the pre-round checkpoint with `revert_on_failure`. The
   engine holds the last 60 seconds of the wall clock back from every model
-  phase so the hidden verifier always grades the final workspace. One
-  read-only anti-anchoring brainstorm pass runs before
-  the first round on tasks worth the overhead (skipped below 24 total steps),
+  phase so the hidden verifier always grades the final workspace. If the
+  manager's reply stays unparseable after the retry, the engine keeps
+  answering: it takes the oldest pending ledger task or opens an issue-driven
+  AUTO task and runs the round, so a silent manager degrades to orchestrated
+  worker rounds instead of ending with zero work. One read-only
+  anti-anchoring brainstorm pass runs before the first round on tasks worth
+  the overhead (skipped below 24 total steps),
   and a bounded finalizer pass runs only when sign-off was not clean. Budgets
   are shared with the plain vulcan loop (same wall-clock deadline, same total
   model-loop steps, same cost cap), with a soft cap of 6 manager rounds and a
@@ -27,10 +31,11 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   columns at equal budgets. Pricing uses the stripped `provider:model` spec
   while the manifest keeps the full engine spec, so leaderboards group
   orchestrated runs separately at directly comparable cost. The summary gains
-  an `orchestration` block (rounds, reverts, per-role token accounting,
-  termination reason) and the trace gains `orchestration_start`,
-  `orchestration_verify`, `orchestration_revert` and `orchestration_end`
-  events, with a `role` tag on every model request.
+  an `orchestration` block (rounds, reverts, manager fallbacks, per-role
+  token accounting, termination reason) and the trace gains
+  `orchestration_start`, `orchestration_verify`, `orchestration_revert`,
+  `orchestration_fallback` and `orchestration_end` events, with a `role` tag
+  on every model request.
 
 - **Devin CLI harness** (`--harness devin`, `devin:<model>` specs,
   `harness/agent/devin_cli.py`): runs a task in Cognition's local Devin agent

@@ -9,8 +9,9 @@ entries here record the measurements behind those rules.
 
 ## 2026-10-18: orchestration reserves grading time and keeps failed-round work
 
-Two run-condition fixes to the orchestrator engine, measured across the 27
-recorded orchestrated runs in `runs/` before the change:
+Three run-condition fixes to the orchestrator engine, measured across the 27
+recorded orchestrated runs in `runs/` (plus a fresh 26-task v1-micro sweep on
+a quantized local ollama model) before the change:
 
 - Grading reserve (default 60s, `grading_reserve_s` in the orchestration
   config). 19 of the 27 orchestrated runs scored functional 0 through the
@@ -29,11 +30,23 @@ recorded orchestrated runs in `runs/` before the change:
   an explicit true. Hidden scoring is partial-credit and the escalation
   reference behavior keeps whatever works, so the failed round's edits stay
   in the workspace while the ledger records the gate as failed.
+- The engine answers when the manager cannot. Across the fresh sweep, 4 of
+  26 runs ended `manager-unreachable` with zero rounds and an empty patch
+  (the quantized model returned non-JSON or empty manager replies; one
+  retry was not enough). When a manager call still yields no usable JSON,
+  the engine now takes the oldest pending ledger task or opens an
+  issue-driven AUTO task and runs the round offline, counting the event in
+  `manager_fallbacks` and tracing `orchestration_fallback`. Termination for
+  an offline sign-off after a passing gate is `offline-complete`. The run
+  stays in the orchestrated column: same shared budgets, same gate, the
+  manager only ever composed task text.
 
 Evidence: `tests/test_orchestrator.py` gained a unit test for the reserve
-view and two end-to-end regressions (a stalling manager whose run self-stops
-on the reserve yet still gets a graded verifier result; a failed round whose
-work survives by default and clears the repair gate).
+view and three end-to-end regressions (a stalling manager whose run
+self-stops on the reserve yet still gets a graded verifier result; a failed
+round whose work survives by default and clears the repair gate; a manager
+that never parses, whose run still lands the write through an AUTO round
+and signs off `offline-complete` with functional 1).
 Revisit when the orchestrated column is published: deadline-stopped runs must
 carry real verifier scores, not budget-exceeded zeros. If the hidden verifier
 for compiled suites needs more than 60s, raise `grading_reserve_s` per run,

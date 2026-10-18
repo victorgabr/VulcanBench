@@ -328,6 +328,7 @@ def run_orchestration(  # noqa: PLR0912, PLR0915  (linear serial loop: guards, r
     last_task_id: str | None = None
     last_round_block = ""
     last_verify_ok = False
+    fallbacks = 0
 
     def manager_message(*, seed: bool, round_block: str) -> str:
         return prompts.manager_user_message(
@@ -368,6 +369,49 @@ def run_orchestration(  # noqa: PLR0912, PLR0915  (linear serial loop: guards, r
             if content is None:
                 return None
             decision = _parse_decision(content)
+        return decision
+
+    def offline_decision() -> dict[str, Any]:
+        """Deterministic round decision when the manager yields no usable JSON.
+
+        The engine must still answer the task: continue the oldest pending
+        ledger task, sign off when the latest gate passed, or open an
+        issue-driven AUTO task. The shared step/round/wall budgets still bind
+        every round, so a silent manager degrades to orchestrated worker
+        rounds instead of ending the run with zero work.
+        """
+        pending = [t for t in ledger.tasks() if t.get("status") == "pending"]
+        if pending:
+            row = pending[0]
+            return {
+                "next": {"task_id": str(row["id"]), "brief": str(row.get("desc", ""))},
+                "complete": False,
+                "reason": "offline fallback: pending ledger task",
+            }
+        if last_verify_ok:
+            return {"complete": True, "reason": "offline fallback: last gate passed"}
+        auto_id = f"AUTO-{rounds + 1}"
+        desc = (
+            "Implement and test a solution for the issue, then leave the repo's "
+            f"own suite passing. Issue: {clip(str(task.issue), 1_500)}"
+        )
+        return {
+            "next": {"task_id": auto_id, "brief": desc},
+            "complete": False,
+            "reason": "offline fallback: issue-driven task",
+        }
+
+    def note_fallback(reason: str) -> None:
+        nonlocal fallbacks
+        fallbacks += 1
+        ledger.append_notes([f"manager unusable ({reason}); offline round {rounds + 1}"])
+        collector.record("orchestration_fallback", {"round": rounds + 1, "reason": reason})
+
+    def manager_or_offline(*, seed: bool, round_block: str) -> dict[str, Any] | None:
+        decision = manager_call(seed=seed, round_block=round_block)
+        if decision is None and not model_deadline.is_expired():
+            note_fallback("manager-unparseable")
+            decision = offline_decision()
         return decision
 
     def apply_decision(decision: dict[str, Any]) -> None:
@@ -417,7 +461,7 @@ def run_orchestration(  # noqa: PLR0912, PLR0915  (linear serial loop: guards, r
 
     # -- seed decision ---------------------------------------------------------------
 
-    decision = manager_call(seed=True, round_block="")
+    decision = manager_or_offline(seed=True, round_block="")
     if decision is not None:
         if decision.get("tasks"):
             try:
@@ -426,7 +470,7 @@ def run_orchestration(  # noqa: PLR0912, PLR0915  (linear serial loop: guards, r
                 ledger.append_notes([f"rejected task seed: {exc}"])
         apply_decision(decision)
     else:
-        termination = "deadline" if deadline.is_expired() else "manager-unreachable"
+        termination = "deadline"
 
     # -- serial rounds -----------------------------------------------------------------
 
@@ -447,11 +491,22 @@ def run_orchestration(  # noqa: PLR0912, PLR0915  (linear serial loop: guards, r
                 # Sign-off counts only when the latest external check passed;
                 # an unverified completion claim routes to the finalizer.
                 finished = last_verify_ok
-                termination = (
-                    "manager-complete" if last_verify_ok else "manager-complete-unverified"
-                )
+                offline_signoff = str(decision.get("reason", "")).startswith("offline fallback")
+                if offline_signoff and last_verify_ok:
+                    termination = "offline-complete"
+                else:
+                    termination = (
+                        "manager-complete" if last_verify_ok else "manager-complete-unverified"
+                    )
             else:
-                termination = "manager-no-task"
+                note_fallback("manager-no-task")
+                fb = offline_decision()
+                if fb.get("complete"):
+                    finished = last_verify_ok
+                    termination = "offline-complete" if last_verify_ok else "manager-no-task"
+                else:
+                    decision = fb
+                    continue
             break
         task_id = str(nxt["task_id"])
         brief = str(nxt.get("brief", "")).strip() or str(nxt.get("desc", ""))
@@ -489,7 +544,7 @@ def run_orchestration(  # noqa: PLR0912, PLR0915  (linear serial loop: guards, r
                     f"stall:\n{clip(fresh_content or '(no output)', WORKER_TAIL)}\n"
                     "Choose a task that is NOT the stalled one, or complete."
                 )
-                decision = manager_call(seed=False, round_block=last_round_block)
+                decision = manager_or_offline(seed=False, round_block=last_round_block)
                 if decision is not None:
                     apply_decision(decision)
                 continue
@@ -593,7 +648,7 @@ def run_orchestration(  # noqa: PLR0912, PLR0915  (linear serial loop: guards, r
                 + ("\nThe workspace was reverted to the pre-round checkpoint." if reverted else "")
                 + "\nThe next task must fix, revert or switch approach."
             )
-            decision = manager_call(seed=False, round_block=last_round_block)
+            decision = manager_or_offline(seed=False, round_block=last_round_block)
             if decision is not None:
                 apply_decision(decision)
             continue
@@ -609,7 +664,7 @@ def run_orchestration(  # noqa: PLR0912, PLR0915  (linear serial loop: guards, r
             f"Worker {task_id} output tail:\n{clip(w_content or '(no text output)', WORKER_TAIL)}"
             f"\n\nVerification: {evidence_line}"
         )
-        decision = manager_call(seed=False, round_block=last_round_block)
+        decision = manager_or_offline(seed=False, round_block=last_round_block)
         if decision is not None:
             apply_decision(decision)
     if termination == "unknown":
@@ -665,6 +720,7 @@ def run_orchestration(  # noqa: PLR0912, PLR0915  (linear serial loop: guards, r
         "llm_calls": spend["calls"],
         "verify_failures": verify_failures,
         "reverts": reverts,
+        "manager_fallbacks": fallbacks,
         "fresh_perspectives": fresh_used,
         "finalizer_used": finalizer_used,
         "final_verify_ok": final_verify_ok,
