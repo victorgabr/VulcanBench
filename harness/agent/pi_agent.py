@@ -1,10 +1,12 @@
-"""Pi coding agent adapter: API-metered runs with audited per-message usage.
+"""Pi coding agent adapter: metered API runs, or local endpoints, audited.
 
 Pi (``@earendil-works/pi-coding-agent``) is a small open-source terminal agent
-that talks to any OpenAI Responses-compatible endpoint. VulcanBench runs it in
-JSON mode against a pinned bundle and an operator-supplied provider config, so
-the only moving parts are the model and Pi's own tool loop. Billing is the
-provider API key, so runs are recorded as metered spend, not subscription use.
+that talks to any OpenAI-compatible endpoint. VulcanBench runs it in JSON mode
+against a pinned bundle and an operator-supplied provider config, so the only
+moving parts are the model and Pi's own tool loop. Metered providers bill as
+API spend; a ``ollama/<tag>`` spec runs against a local Ollama server with no
+spend. Confinement is the macOS seatbelt or, on Linux, a bubblewrap sandbox;
+without either the run is recorded unconfined.
 
 Imported lazily by cli_agents to avoid circular adapter registration.
 """
@@ -17,6 +19,7 @@ import os
 import shutil
 import signal
 import subprocess
+import sys
 import tempfile
 import threading
 import uuid
@@ -40,6 +43,16 @@ from harness.redaction import sanitize
 # the adapter always exports as MUSE_API_KEY for Meta.
 MODELS = {"meta/muse-wonder-1.0": ("MUSE_API_KEY", "META_MUSE_SPARK_API", "MODEL_API_KEY")}
 CHILD_KEY_ENV = {"meta": "MUSE_API_KEY"}
+# Specs like "ollama/<tag>" or "jaguar/<model>" reach an operator-declared
+# endpoint: the models.json in VULCANBENCH_PI_CONFIG declares the provider
+# block (baseUrl + api + models) and carries the key or a dummy, so no API
+# key environment variable is required.
+PROTECTED_PATHS = (
+    Path(__file__).resolve().parents[2],
+    Path.home() / ".codex",
+    Path.home() / ".claude",
+    Path.home() / ".local/share/muse/sessions",
+)
 DISABLED_RESOURCES = (
     "--no-session",
     "--no-context-files",
@@ -67,6 +80,41 @@ def pinned_install() -> tuple[Path, Path, str, Path]:
     if not str(config) or not (config / "models.json").is_file():
         raise ProviderError("Set VULCANBENCH_PI_CONFIG to a directory holding models.json")
     return node.resolve(), cli.resolve(), actual, config.resolve()
+
+
+def _declared_providers() -> dict[str, Any]:
+    """Providers declared in the operator's models.json (local or proxied endpoints)."""
+    config = Path(os.environ.get("VULCANBENCH_PI_CONFIG", ""))
+    try:
+        data = json.loads((config / "models.json").read_text())
+    except (OSError, ValueError):
+        return {}
+    return data.get("providers") or {}
+
+
+def _bwrap_argv(workspace: Path, scratch: Path) -> list[str]:
+    """Linux confinement: host read-only, writes only workspace and scratch,
+    the benchmark checkout and vendor agent dirs masked with tmpfs."""
+    argv = [
+        "bwrap",
+        "--ro-bind",
+        "/",
+        "/",
+        "--dev",
+        "/dev",
+        "--proc",
+        "/proc",
+        "--bind",
+        str(workspace),
+        str(workspace),
+        "--bind",
+        str(scratch),
+        str(scratch),
+    ]
+    for path in PROTECTED_PATHS:
+        if path.is_dir():
+            argv += ["--tmpfs", str(path)]
+    return argv
 
 
 def _version(node: Path, cli: Path) -> str | None:
@@ -133,7 +181,7 @@ class PiAdapter:
             True,
             True,
             False,
-            "macOS outer sandbox; isolated writes; repository read deny",
+            "macOS seatbelt or Linux bubblewrap outer sandbox; isolated writes; read deny",
         )
 
     def preflight(self) -> HarnessPreflight:
@@ -142,7 +190,12 @@ class PiAdapter:
         except ProviderError as exc:
             return HarnessPreflight(self.harness_id, False, None, False, None, detail=str(exc))
         version = _version(node, cli)
-        has_key = any(os.environ.get(k) for keys in MODELS.values() for k in keys)
+        endpoint = any(
+            isinstance(cfg, dict) and cfg.get("baseUrl")
+            for name, cfg in _declared_providers().items()
+            if name != "meta"
+        )
+        has_key = any(os.environ.get(k) for keys in MODELS.values() for k in keys) or endpoint
         return HarnessPreflight(
             self.harness_id,
             bool(version),
@@ -175,21 +228,25 @@ class PiAdapter:
         del kwargs
         if agent_container:
             raise ProviderError("Pi runs locally under the outer sandbox, not in a container")
-        if model not in MODELS:
-            raise ProviderError(f"Pi model {model!r} is not configured for VulcanBench")
+        provider, _, provider_model = model.partition("/")
         if effort is None:
             raise ProviderError("Pi requires an explicit thinking level")
         if timeout_s is None or timeout_s <= 0:
             raise ProviderError("Pi requires a positive wall-clock timeout")
-        provider, _, provider_model = model.partition("/")
-        key = next((os.environ[k] for k in MODELS[model] if os.environ.get(k)), None)
-        if not key:
-            raise ProviderError(f"Pi needs one of {', '.join(MODELS[model])} for {model}")
+        node, cli, bundle_sha256, config = pinned_install()
+        if model not in MODELS and provider not in _declared_providers():
+            raise ProviderError(
+                f"Pi model {model!r} is not configured for VulcanBench: declare the "
+                f"{provider!r} endpoint (baseUrl + api + models) in {config / 'models.json'}"
+            )
+        if model in MODELS:
+            key = next((os.environ[k] for k in MODELS[model] if os.environ.get(k)), None)
+            if not key:
+                raise ProviderError(f"Pi needs one of {', '.join(MODELS[model])} for {model}")
         checked = self.preflight()
         # HarnessPreflight.ready means subscription-ready; Pi is API-billed by design.
         if not (checked.available and checked.authenticated):
             raise ProviderError(f"Pi preflight failed: {checked.detail}")
-        node, cli, bundle_sha256, config = pinned_install()
         config_sha256 = hashlib.sha256((config / "models.json").read_bytes()).hexdigest()
         workspace = Path(workspace).resolve()
         scratch = Path(tempfile.mkdtemp(prefix="vb-pi-session-")).resolve()
@@ -199,7 +256,6 @@ class PiAdapter:
         env = _subscription_env()
         env.update(
             {
-                CHILD_KEY_ENV[provider]: key,
                 "PI_CODING_AGENT_DIR": str(agent_dir),
                 "PI_OFFLINE": "1",
                 "TMPDIR": str(scratch / "tmp"),
@@ -207,13 +263,39 @@ class PiAdapter:
                 "TEMP": str(scratch / "tmp"),
             }
         )
-        profile = boundary_profile(workspace, scratch)
-        profile_path = scratch / "boundary.sb"
-        profile_path.write_text(profile)
+        if model in MODELS:
+            env[CHILD_KEY_ENV[provider]] = key
+        if sys.platform == "darwin":
+            profile = boundary_profile(workspace, scratch)
+            profile_path = scratch / "boundary.sb"
+            profile_path.write_text(profile)
+            confinement = ["/usr/bin/sandbox-exec", "-f", str(profile_path)]
+            boundary_note = (
+                "macOS outer sandbox; workspace/session writes; shared-temp/checkout read deny; "
+                "explicit TMPDIR context; no web tools; shell network not isolated; API key in "
+                "the agent environment"
+            )
+            context = sandbox_context(scratch)
+        elif shutil.which("bwrap"):
+            confinement = _bwrap_argv(workspace, scratch)
+            boundary_note = (
+                "Linux bubblewrap outer sandbox; host read-only; workspace/session writes only; "
+                "benchmark checkout and vendor agent dirs masked with tmpfs; network shared for "
+                "local inference; explicit TMPDIR context; no web tools"
+            )
+            context = sandbox_context(scratch)
+        else:
+            confinement = []
+            boundary_note = (
+                "no OS confinement: neither seatbelt nor bubblewrap is active, the agent ran "
+                "directly on the host"
+            )
+            context = (
+                f"Execution environment: write temporary files inside the workspace or "
+                f"$TMPDIR ({scratch / 'tmp'}).\n\n"
+            )
         cmd = [
-            "/usr/bin/sandbox-exec",
-            "-f",
-            str(profile_path),
+            *confinement,
             str(node),
             str(cli),
             "--mode",
@@ -225,7 +307,7 @@ class PiAdapter:
             provider_model,
             "--thinking",
             effort,
-            sandbox_context(scratch) + prompt,
+            context + prompt,
         ]
         session_id = str(uuid.uuid4())
         collector.record(
@@ -249,14 +331,10 @@ class PiAdapter:
             requested_model=model,
             session_id=session_id,
             harness_version=checked.version,
-            auth_method="api-key",
+            auth_method="api-key" if model in MODELS else "endpoint-configured",
             billing="api",
-            cost_basis="metered-api-pricing",
-            execution_boundary=(
-                "macOS outer sandbox; workspace/session writes; shared-temp/checkout read deny; "
-                "explicit TMPDIR context; no web tools; shell network not isolated; API key in "
-                "the agent environment"
-            ),
+            cost_basis=("metered-api-pricing" if model in MODELS else "operator-endpoint-declared"),
+            execution_boundary=boundary_note,
         )
         proc = subprocess.Popen(
             cmd,
@@ -344,7 +422,8 @@ class PiAdapter:
             archive = Path(stream_log_path).parent / "pi-session"
             archive.mkdir(exist_ok=True)
             (archive / "stderr.txt").write_text(str(sanitize("".join(errors))))
-            (archive / "boundary.sb").write_text(profile)
+            if sys.platform == "darwin":
+                (archive / "boundary.sb").write_text(profile)
         outcome.prompt_tokens = totals["input"] + totals["cacheRead"] + totals["cacheWrite"]
         outcome.completion_tokens = totals["output"]
         outcome.cached_input_tokens = totals["cacheRead"]

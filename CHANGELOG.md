@@ -9,6 +9,20 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Added
 
+- **Pi harness local endpoints and Linux confinement** (`--harness pi`,
+  `harness/agent/pi_agent.py`): a `pi:<provider>/<model>` spec now resolves
+  against the operator's Pi `models.json` (declare any OpenAI-compatible
+  endpoint, e.g. Ollama or llama.cpp, with baseUrl, api and models), so
+  local or proxied models run through the Pi coding agent with no API key
+  environment variable; usage receipts still fold into the token and cost
+  accounting and unpriced local models record cost as $0. The adapter pins
+  the Pi node bundle by SHA-256 (`VULCANBENCH_PI_NODE`,
+  `VULCANBENCH_PI_CLI`, `VULCANBENCH_PI_SHA256`, `VULCANBENCH_PI_CONFIG`),
+  removes web and session features, and confines the agent to the task
+  workspace: Seatbelt on macOS, bubblewrap on Linux (host read-only, writes
+  only to the workspace and scratch dirs, benchmark checkout and vendor
+  agent dirs masked with tmpfs, network shared for local inference only).
+
 - **Ledger orchestration engine** (`--harness orchestrator`, composed spec
   `orchestrator:provider:model`): the API tool loop runs under a manager that
   plans from a persistent on-disk ledger (plan, task list, notes, verification

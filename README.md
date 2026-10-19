@@ -159,6 +159,7 @@ vulcanbench run --suite cii-v4 --harness codex --billing subscription \
 | ZCode | `zcode` | `zcode login` (GLM Coding Plan) | permission mode `yolo`, web tools removed |
 | Muse Code | `muse-code` | Muse account | macOS outer sandbox, isolated session data, repository read denied |
 | Devin CLI | `devin` | `devin auth login` (Devin account) | print mode, permission mode `dangerous`, web tools disabled; effort is the model id's last token (`swe-2-medium|high|max`); no API price, so cost is recorded as unavailable |
+| Pi | `pi` | API key env or an endpoint declared in Pi `models.json` | content-pinned node bundle; macOS Seatbelt / Linux bubblewrap outer sandbox; local endpoints cost $0 |
 
 Muse Code runs only from a content-pinned binary so an auto-updating launcher
 can never change the system under test mid-sweep:
@@ -169,6 +170,18 @@ export VULCANBENCH_MUSE_SHA256=<sha256 of that file>
 vulcanbench harness doctor muse-code
 vulcanbench run --suite cii-v4 --harness muse-code --model muse-spark-1.3 \
   --effort high --timeout 5400 --sandbox docker --no-judges
+```
+
+Pi also benchmarks local or proxied models: declare the endpoint (baseUrl,
+api, models) in the Pi config and point the adapter at the pinned install.
+
+```bash
+export VULCANBENCH_PI_NODE=/absolute/path/to/node
+export VULCANBENCH_PI_CLI=/absolute/path/to/pi/cli.js
+export VULCANBENCH_PI_SHA256=<sha256 of that cli.js>
+export VULCANBENCH_PI_CONFIG=/absolute/path/to/pi-config   # holds models.json
+vulcanbench run --task hello-world --harness pi \
+  --model ollama:llama3:latest --effort low --no-judges --timeout 900
 ```
 
 Muse requires an explicit model and effort and a positive wall-clock timeout,
