@@ -160,6 +160,7 @@ vulcanbench run --suite cii-v4 --harness codex --billing subscription \
 | Muse Code | `muse-code` | Muse account | macOS outer sandbox, isolated session data, repository read denied |
 | Devin CLI | `devin` | `devin auth login` (Devin account) | print mode, permission mode `dangerous`, web tools disabled; effort is the model id's last token (`swe-2-medium|high|max`); no API price, so cost is recorded as unavailable |
 | Pi | `pi` | API key env or an endpoint declared in Pi `models.json` | content-pinned node bundle; macOS Seatbelt / Linux bubblewrap outer sandbox; local endpoints cost $0 |
+| OMP | `omp` | the user's `~/.omp` config or `VULCANBENCH_OMP_CONFIG_DIR` | content-pinned binary; macOS Seatbelt / Linux bubblewrap outer sandbox; local endpoints cost $0 |
 
 Muse Code runs only from a content-pinned binary so an auto-updating launcher
 can never change the system under test mid-sweep:
@@ -182,6 +183,16 @@ export VULCANBENCH_PI_SHA256=<sha256 of that cli.js>
 export VULCANBENCH_PI_CONFIG=/absolute/path/to/pi-config   # holds models.json
 vulcanbench run --task hello-world --harness pi \
   --model ollama:llama3:latest --effort low --no-judges --timeout 900
+```
+
+OMP benchmarks the omp coding agent (a pi fork) the same way, pinning the
+executable instead of a node bundle:
+
+```bash
+export VULCANBENCH_OMP_BIN=/absolute/path/to/omp
+export VULCANBENCH_OMP_SHA256=<sha256 of that file>
+vulcanbench run --task hello-world --harness omp \
+  --model jaguar/qwen3.8-flash-next-iq3_s --effort low --no-judges --timeout 900
 ```
 
 Muse requires an explicit model and effort and a positive wall-clock timeout,

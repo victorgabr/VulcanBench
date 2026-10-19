@@ -23,6 +23,19 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   only to the workspace and scratch dirs, benchmark checkout and vendor
   agent dirs masked with tmpfs, network shared for local inference only).
 
+- **OMP coding-agent harness** (`--harness omp`,
+  `harness/agent/omp_agent.py`): runs the omp CLI (pi fork, verified on
+  v18.12.1) as the solver under the same outer sandbox as Pi (macOS
+  Seatbelt, Linux bubblewrap). The binary is content-pinned via
+  `VULCANBENCH_OMP_BIN` and `VULCANBENCH_OMP_SHA256`; the benchmark
+  profile defaults to the operator's own `~/.omp` config (any provider
+  declared there, e.g. a local llama.cpp or Ollama endpoint, is usable)
+  or a pinned copy via `VULCANBENCH_OMP_CONFIG_DIR`. Each run gets a
+  scratch HOME so omp's live runtime state cannot touch the operator's
+  tree mid-sweep. `--model <provider>/<model>` passes through verbatim,
+  `--thinking` carries the effort label, and omp's usage receipts fold
+  into the standard token and cost accounting.
+
 - **Ledger orchestration engine** (`--harness orchestrator`, composed spec
   `orchestrator:provider:model`): the API tool loop runs under a manager that
   plans from a persistent on-disk ledger (plan, task list, notes, verification

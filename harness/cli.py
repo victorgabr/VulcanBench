@@ -216,12 +216,12 @@ def run(  # noqa: PLR0912, PLR0915, CLI entry: option declarations + linear guar
         "-m",
         help="Model id. Use provider:model for Vulcan's API loop, provider:model "
         "with --harness orchestrator for the ledger engine, or a bare model "
-        "with --harness claude-code|codex|cursor|grok-build|zcode|muse-code|devin|pi.",
+        "with --harness claude-code|codex|cursor|grok-build|zcode|muse-code|devin|pi|omp.",
     ),
     harness_name: str = typer.Option(
         "vulcan",
         "--harness",
-        help="Execution harness: vulcan|orchestrator|claude-code|codex|cursor|grok-build|zcode|muse-code|devin|pi",
+        help="Execution harness: vulcan|orchestrator|claude-code|codex|cursor|grok-build|zcode|muse-code|devin|pi|omp",
     ),
     billing: str = typer.Option(
         "auto",

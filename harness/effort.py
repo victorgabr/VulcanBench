@@ -193,6 +193,8 @@ _PROVIDER_EFFORT_MAPS = {
     "zcode": _ZCODE_EFFORT_VALUES,
     "devin": _DEVIN_EFFORT_VALUES,
     "pi": _PI_EFFORT_VALUES,
+    # omp (a pi fork) exposes the same --thinking enum as Pi.
+    "omp": _PI_EFFORT_VALUES,
 }
 
 
